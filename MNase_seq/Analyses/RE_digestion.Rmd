@@ -1,0 +1,245 @@
+---
+title: "MNaseSeq Analysis RE digestion"
+author: "Muhunden Jayakrishnan"
+date: "12/13/2025"
+output: html_document
+---
+
+Generate heatmaps for RE sites for the different RE-digestion samples (Extended Data 6)
+
+## Setup
+
+```{r}
+
+rm(list=ls())
+
+```
+
+
+
+```{r}
+library(tidyverse)
+library(LSD)
+library(RColorBrewer)
+library(rtracklayer)
+library(GenomicAlignments)
+library(IRanges)
+#library(ShortRead)
+library(rtracklayer)
+library(circlize)
+#library(genefilter)
+library(ggplot2)
+library(zoo)
+library(gridExtra)
+library(HelpersforChIPSeq)
+```
+
+
+Helper function to generate coverages around RE sites
+
+```{r}
+coverageWindowsStranded <- function(centers, window.size = 2000, coverage) {
+
+  centers <- centers[centers$chr %in% names(coverage),]
+  result <- sapply(names(coverage), function(x) {
+    my.cov <- coverage[[x]]
+    my.peaks <- centers[centers$chr==x,]
+    mw.views <- Views(my.cov, start=my.peaks$center-ceiling(window.size/2), width=window.size+1)
+    ## remove out-of bounds views
+    flt <- start(mw.views)>0 & end(mw.views) < length(my.cov)
+    mw.views <- mw.views[flt,]
+    my.peaks <- my.peaks[flt,]
+    if (length(mw.views) > 0) {
+      mat <- as.matrix(mw.views)
+      colnames(mat) <- seq(from=(0-ceiling(window.size/2)), to=0+ceiling(window.size/2))
+      rownames(mat) <- rownames(my.peaks)
+      return(mat)
+    } else {
+      return(NULL)
+    }
+  })
+  mat <- Reduce(rbind, result)
+  centers <- centers[rownames(centers) %in% rownames(mat),]
+  na.omit(match(rownames(centers), rownames(mat)) )-> o
+  centers <- centers[o,]
+  mat[centers$strand=="-",] <- t(apply(mat[centers$strand=="-",],1,rev))
+  mat
+}
+
+
+```
+
+Read in copyNormalized MNase-seq coverage files for RE experiments
+
+
+```{r}
+
+my_sample_table <- readxl::read_excel(path="/Users/ra36doj/Desktop/mount/Hi_C/MicroC_Analyses/251202_Final/SampleSheet_Master.xlsx",col_names = TRUE) %>% filter(grepl("RE_digestion",Groups))
+
+```
+
+
+```{r}
+
+#my_coverage_file_names <- list.files(pattern = "ranges_copyNorm.bw")
+#my_coverage_file_names_RE <- my_coverage_file_names[my_coverage_file_names %in% paste0(my_sample_table$MNaseSeq_fileName,"_ranges_copyNorm.bw")]
+
+my_coverage_file_names <- list.files(pattern = "_ranges_noSizeSelect_copyNorm.bw")
+my_coverage_file_names_RE <- my_coverage_file_names[my_coverage_file_names %in% paste0(my_sample_table$MNaseSeq_fileName,"_ranges_noSizeSelect_copyNorm.bw")]
+
+
+cov_list <- list()
+
+for(i in seq_along(my_coverage_file_names_RE)){
+
+  bw_file <- file.path("./", my_coverage_file_names_RE[i])
+
+  cov <- import(
+    bw_file,
+    format = "BigWig",
+    as = "RleList"
+  )
+
+  name <- sub("\\.bw$", "", my_coverage_file_names_RE[i])
+
+  cov_list[[name]] <- cov
+
+  
+}
+
+```
+
+Read in coordinates of RE sites (identified using jvarkit tools) and generate coverage matrices around these sites 
+
+```{r}
+res_sites <- read.delim(file="/Users/ra36doj/Desktop/mount/ChIP_Seq/240205_SandroFosmids/FosmidsGenome/GenomeAssembly_v4/REsites_final_FosGen.bed",header=F)
+
+res_sites %>% group_by(V7) %>% summarize(count=n())
+
+```
+
+We have 10 AscI, FseI and SrfI sites, 26 SfiI sites and 87 BsiWI sites 
+
+First generate centers for each RE sites
+
+```{r}
+
+for (i in unique(res_sites$V7)){
+  new_centers <- res_sites %>% filter(V7==i) %>% transmute(chr=V1,strand=V6,center=round((V2+V3)/2))
+  rownames(new_centers) <- paste0(new_centers$chr," ",new_centers$center)
+  
+  assign(paste0(i,"_centers"),new_centers)
+}
+
+rm(new_centers)
+
+centers_list <- ls(pattern=".*_centers$")
+
+```
+
+
+
+```{r}
+
+### Generate matrices containing binned coverage around 2.5kb from center of RE site
+
+my_window_size <- 5000
+my_binning <- 10
+
+
+mat_path <- file.path("./matrices_site_centered_noSizeSelect")
+
+if(!dir.exists(mat_path))
+  dir.create(mat_path)
+
+i=1
+j=1
+
+parallel::mclapply(seq_along(cov_list), mc.cores = 4, FUN = function(i){
+  for (j in seq_along(centers_list)){
+    my_name <-  paste("mat" ,gsub("_centers","",centers_list[j]), gsub("_ranges_noSizeSelect_copyNorm","",names(cov_list)[i]), sep=".")
+    
+    my_cov <- cov_list[[i]]
+    
+    my_mat <- coverageWindowsCenteredStranded(centers = get(centers_list[j]),
+                                              window.size = my_window_size,
+                                              coverage = my_cov)
+    
+    my_mat <- binMeansMatrix(my_mat, my_binning)
+    
+    assign(my_name, my_mat)
+
+    saveRDS(my_mat, file = paste0(mat_path,"/",my_name,".rds"))
+  }
+})
+
+
+```
+
+Load intermediate matrices
+
+```{r}
+
+
+my_mat_file_names <- list.files(path = "matrices_site_centered_noSizeSelect/",pattern = ".rds")
+
+for(i in seq_along(my_mat_file_names)){
+  
+  my_mat <- readRDS(file=paste0("./matrices_site_centered_noSizeSelect/",my_mat_file_names[i]))
+  assign(my_mat_file_names[i],my_mat)
+  
+}
+
+
+```
+Plot heatmaps (Extended Data 6b)
+
+```{r}
+
+
+my_mats <- ls(pattern = "^mat.")[-1]
+
+i=1
+
+
+for(i in seq_along(centers_list)){
+  
+  my_site <- gsub("_centers","",centers_list[i])
+  
+  my_subset <- my_sample_table %>% filter(Treatment_Condition %in% c("Control",my_site))
+  
+  my_mats_site <- my_mats[my_mats %in% paste0("mat.",my_site,".",my_subset$MNaseSeq_fileName,".rds")]
+  
+  number_sites <- nrow(get(my_mats_site[1]))
+  
+  pdf(paste("./matrices_site_centered_noSizeSelect/heatmaps.",my_site,"_",number_sites,".pdf",sep=""), height = 7, width = 20)
+
+  ### order heatmap based on cutting efficiency of a cut sample 
+  
+  my_mats_site_RE <- my_mats_site[my_mats_site %in% paste0("mat.",my_site,".",(my_subset %>% filter(Treatment_Condition == my_site) %>% pull(MNaseSeq_fileName)),".rds")]
+  
+  my_order <- order(rowMeans(get(my_mats_site_RE[1])), decreasing = F) ## order according to signal depletion upon cutting
+    
+  orderMats(my_mats = my_mats_site,
+              my_order = my_order)
+    
+  all(sapply(seq_along(my_mats_site), function(i){(identical(rownames(get(my_mats_site[length(my_mats_site)])), rownames(get(my_mats_site[i]))))}))
+    
+    
+  HelpersforChIPSeq::plotHeatmap(my_sample_mats = my_mats_site, 
+                                   my_sample_names = gsub(".rds","",gsub("mat.","",my_mats_site)),
+                                   my_site_name = my_site,
+                                   my_binning = my_binning,
+                                   my_colors = colorRampPalette(rev(brewer.pal(n = 9, name ="RdYlBu")))(100),
+                                   min_value = 0,
+                                   max_value = 2
+  )
+    
+  dev.off()
+
+  
+}
+
+
+```
+

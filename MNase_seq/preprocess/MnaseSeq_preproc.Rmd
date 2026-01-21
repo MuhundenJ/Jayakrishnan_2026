@@ -1,0 +1,211 @@
+---
+title: "Data preprocessing Nucleosome Phasing in DREX assemblies"
+output: html_document
+---
+
+First run align_array set of scripts (Baldi et al., Mol Cell 2018) to generate ranges.rds (along with .sam and .bam intermediate files) objects containing aligned reads. 
+
+This script uses the ranges.rds to generate normalized coverage .bw files (for vizualisation on IGV) and dyadcov.rds files (for calling Phased Nucleosome Arrays etc. using SDE scripts)
+
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r init, message=FALSE}
+library(stringr)
+library(GenomicFeatures)
+library(RColorBrewer)
+library(matrixStats)
+library(grid)
+library(gridBase)
+library(gridExtra)
+library(tsTools)
+library(BiocParallel)
+library(GenomicAlignments)
+library(LSD)
+library(csaw)
+library(pheatmap)
+library(Vennerable)
+library(writexl)
+library(LSD)
+library(TxDb.Dmelanogaster.UCSC.dm6.ensGene)
+library(IRanges)
+#library(ShortRead)
+library(ComplexHeatmap)
+library(circlize)
+library(dendextend)
+library(genefilter)
+library(tidyverse)
+library(zoo)
+library(matrixStats)
+library(tsTools)
+library(Vennerable)
+#library(HelpersforChIPSeq)
+library(plotly)
+library(pbapply)
+library(ggsci)
+library(BSgenome.Dmelanogaster.UCSC.dm6)
+library(multtest)
+library(ChIPpeakAnno)
+
+#source("../functions/functions.R")
+
+`%nin%` = Negate(`%in%`)
+
+
+```
+
+### Load necessary files 
+
+Load MNase-seq coverages and preprocess data to downsample to lowest library size(important!), size-select nucleosomal fragments, center the fragments and trim to 50 bp (indicative of nucleosomal centers). Also apply a 'copy number' normalization.
+
+```{r data-preproc}
+
+my_Fos_chromosomes <- read.delim("../../240205_SandroFosmids/FosmidsGenome/GenomeAssembly_v4/28xFos_genome.bed",header=F) %>% mutate(name=paste0(V4,"::",V1,":",V2,"-",V3))
+
+
+files <- list.files("../processed/", pattern = ".rds",full.names = T)
+file_names <- gsub(".rds","",list.files("../processed/", pattern = ".rds",full.names = F))
+
+
+rangesList <- lapply(files, function(x) {
+   readRDS(x)
+})
+
+
+```
+
+
+Below we perform a copy number normalization to homogenize coverage for each Fosmid/BAC. Note that after this operation, its not appropriate to compare Phasing ACROSS DNA constructs, but facilitates comparison FOR A GIVEN CONTRAST ACROSS TREATMENTS (AND DIFFERENT DNA POOL PREPARATIONS)!
+
+```{r data-preproc_2}
+## filter fragments for size 120-200
+rangesList <- pblapply(rangesList, function(x) {
+  flt <- width(x) >= 120 & width(x) <= 200
+  x[flt]
+})
+
+## subsample to smallest library size -- NOTE: Only required for PNA calculations - but verified that it doesnt make a big difference
+minLibSize <- min(unlist(lapply(rangesList, length)))
+subRangesList <- pblapply(rangesList, function(x) {
+   set.seed(1234)
+   idx <- sample(1:length(x), minLibSize)
+   x[idx]
+ })
+
+#subRangesList <- rangesList
+
+## coverages of 50bp dyads - along with copy number + effective length normalization 
+
+
+dyadCovList <- pblapply(subRangesList, function(x){
+  
+  dyads <- resize(x, 50, fix="center")
+  y <- coverage(dyads)    ## standard not normalized !
+  norm_cov <- y/sum(y)
+  
+  ## Note - For copy number normalization, the normal way would be to scale up reads for BAC/Fosmid based on its corresponding size. 
+  ## But here there is a special problem, where some fosmids are overlapping. Because of the overlap, multimappers are removed and you have many 'gaps'.
+  ## You need to use an 'effective size' without gaps instead of total length, otherwise reads coming from the overlapping fosmids are overestimated. 
+
+  
+  # an easy hack is to estimate the effective size from the RLE length -> RLE format is a highly compressed format storing 'runs' (consecutive occurences of same
+  # value) as a single value. The overlap can be either on the 5' or 3' ends of the BAC/Fos. 
+  # If the overlap is on the 3' end, then the RLE run is terminated prematurely, .i.e, the run length is shorter than the original BAC/Fos size. (ex- BAC 2 is only 76kb length while original length is around 92 kb)
+  # The way the data is structured in RLE lists, if you have overlap on the 5' end (.i.e 0 reads), then the length of these 0 runs can be extracted using sum(RLE==0)
+  
+  # The difference gives size of regions where reads are actually mapped ! 
+
+  my_norm_factors <- lengths(norm_cov) - sum(norm_cov==0)
+  
+  y_2 <- norm_cov * my_norm_factors
+  y_2
+
+})
+
+names(dyadCovList) <- file_names
+
+lapply(file_names, function(x) {
+   saveRDS(dyadCovList[[x]], paste0(x,"_dyadCov.rds"))
+   export.bw(dyadCovList[[x]],paste0(x,"copyNorm.bw"))
+})
+
+
+```
+
+We need to calculate spectralRepeatLength prior to calling PNAs (this script generates spectralRepeatLength.rdsobject which is needed by SDE family of scripts)
+
+## Get autocorrelation function based on Baldi et al 
+
+We look at autocorrelation BAC/Fos wide and calculate repeat lengths which are necessary for Spectral Density Estimation. This reflects the periodicity of nucleosome positions in the data. We can either use all samples or just control samples, but the calculated repeat lengths are not very different (~180bp)
+
+```{r ACF_genomewide}
+
+
+my_control_samples <- c("ControlPooled","MJ28_1D","MJ29_9D","MC11_8D","MC12_1D","MC13_1D","MC14_1D","MC15_1D","MC19_1D","MC201_1D")
+
+peaks<-function(series,span=100) 
+{ 
+	z <- embed(series, span) 
+	s <- span%/%2 
+	v<- max.col(z) == 1 + s 
+	result <- c(rep(FALSE,s),v) 
+	result <- result[1:(length(result)-s)] 
+	result 
+} 
+
+max.lag <- 1000
+
+dyadCovList_sub <- dyadCovList[gsub("_ranges","",names(dyadCovList)) %in% my_control_samples]
+
+repeatLengths <- pblapply(dyadCovList_sub, function(my_cov){
+  cov <- my_cov
+  v <- as.vector(unlist(cov))
+  ac <- acf(v, lag.max=max.lag)
+
+  y <- as.vector(ac$acf)
+  x <- 0:max.lag
+  peaksPos <- which(peaks(y, span=100))[1:4]
+  Peaks <- 1:length(peaksPos)
+  fit <- lm(peaksPos ~ Peaks - 1)
+  return(list(y,peaksPos,unname(round(fit$coefficients[1]))))
+
+})
+
+#print(repeatLengths)
+
+acf_data <- cbind(data.frame(lag=0:max.lag),as.data.frame(lapply(repeatLengths, `[[`, 1)))
+
+plt <- acf_data %>% pivot_longer(cols=-lag,names_to="Sample",values_to = "ACF") %>% ggplot(aes(x=lag,y=ACF,col=Sample)) + geom_line() + scale_color_tron() +theme_bw() 
+plt <- plt +
+  theme(
+    legend.position = "bottom",          
+    legend.text = element_text(size = 6),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(0.3, "cm"),
+    legend.spacing.y = unit(0.05, "cm")
+  )
+
+#plt + geom_vline(xintercept = repeatLengths[[1]][[2]],color="red",linetype="dashed",alpha=0.5) + geom_vline(xintercept = repeatLengths[[2]][[2]],color="blue",linetype="dashed",alpha=0.5)
+
+# 
+# peak_labels <- rbind(
+#   data.frame(x=repeatLengths[[1]][[2]],y=acf_data$MJ26_5_ranges[repeatLengths[[1]][[2]]], name="MJ26_5_ranges"),
+#   data.frame(x=repeatLengths[[2]][[2]],y=acf_data$MJ26_5_ranges[repeatLengths[[2]][[2]]], name="MJ26_6_ranges")
+# )
+# 
+# plt <- plt + ggrepel::geom_text_repel(data=peak_labels, aes(x=x,y=y,label=x,color=name))
+
+pdf(file="ACF_BACFoswide_Control.pdf",width = 7,height = 10)
+plt
+dev.off()
+
+spectralRepeatLength <- median(unlist(lapply(repeatLengths, `[[`, 3)))
+spectralRepeatLength
+saveRDS(spectralRepeatLength, "spectralRepeatLength.rds")
+```
+
+

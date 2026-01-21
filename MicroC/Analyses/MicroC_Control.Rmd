@@ -1,0 +1,384 @@
+---
+title: "MicroC PooledControl Analyses "
+author: "Muhunden Jayakrishnan"
+date: "02/12/2025"
+output: html_document
+---
+
+MicroC analyses of pooled control samples 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+## Install GENOVA -- Note that installation works only from local RProjects (.ie. not on mounted network drives!)
+library("remotes")
+library("GENOVA")
+library("tibble")
+library("tidyverse")
+library("GenomicRanges")
+library("HiCExperiment")
+library("HiCool")
+library("HiContacts")
+library("HiContactsData")
+library("fourDNData")
+library("DNAZooData")
+library("InteractionSet")
+
+```
+
+Read in and process Control mcool file generated from pooling all control samples in this study 
+
+```{r}
+
+Fos_pool <- import(CoolFile("../cool_files/MCControlPooled.mcool"),resolution=200)
+
+#Vizualize the eve TAD
+  
+plotMatrix(subsetByOverlaps(Fos_pool,GRanges(data.frame(chrom="MG_3::chr2R:9937874-10035582",start=0,end=10035582-9937874))),use.scores="balanced",limits=c(-4,-1))
+
+```
+Vizualize 'trans' interactions across fosmids (Extended Data 2)
+
+```{r}
+
+Fos_pool <- zoom(Fos_pool, resolution=400)
+
+pdf("TransInteractions.pdf")
+plotMatrix(Fos_pool,use.scores="balanced",limits=c(-3,-2))
+dev.off()
+
+```
+
+Generate diamond insulation scores across the pool at 3 resolutions 800, 1600, 3200. They are mostly consistent, so use 1600bp for downstream analyses.
+
+```{r}
+Fos_pool <- zoom(Fos_pool, resolution=200)
+
+window_sizes <- c(800,1600,3200)
+
+for (i in window_sizes){
+  
+  Fos_pool <- getDiamondInsulation(Fos_pool,window_size = i)
+
+  coverage(metadata(Fos_pool)$insulation, weight = 'insulation') |> rtracklayer::export.bw(paste0('MC_pooled_insulation_',i,"kbWin.bw"))
+
+}
+
+Fos_pool <- getDiamondInsulation(Fos_pool,window_size = 1600)
+
+coverage(metadata(Fos_subset)$insulation, weight = 'insulation') %>% saveRDS("Insulation.rds")
+
+```
+
+#Boundary calling 
+
+We need to call boundaries from the insulation data. However, regions with coverage masks, overlapping regions from 2 constructs and edge of constructs all produce low insulation scores. So exclude them to define strict boundaries. 
+
+Step 1)
+
+Generate a '0' Hi-C coverage vector to exclude problematic blacklist regions (takes care of coverage dropout areas and overlaps) 
+
+I couldn't find a straightforward way to extract this coverage vector from HiCExperiment objects. So a hacky way is to extract regions which are represented in the interactions() data (missing regions are not represented) and find complementary regions. Note that the stringent version of this is generated from ICEd matrices with default matrices, which are more rigorous in masking out MNase-overdigestion prone areas. 
+
+```{r}
+
+my_chromosomes <- seqlevels(Fos_pool)
+
+
+#bin_df <- "FlyFos025448::chrX:5318986-5352179"
+
+get_missing_bins <- function(bin_df, chrom_start = 0, chrom_end) {
+  
+  chrom_start = 0
+  chrom_end = diff(as.numeric(tail(strsplit(bin_df, "[:-]")[[1]], 2)))
+  
+  Fos_subset <- subsetByOverlaps(Fos_pool,GRanges(data.frame(chrom=bin_df,start=0,end=chrom_end)))
+  
+  Fos_valid_regions <- Fos_subset %>% interactions() %>% as.data.frame() %>% filter(!is.nan(weight1)) %>% select(start1,end1) %>% distinct()
+
+  all_starts <- seq(chrom_start+1, chrom_end - 199, by = 200)
+  
+  expected_bins <- data.frame(
+    start1 = all_starts,
+    end1 = all_starts + 199
+  )
+  
+  missing_bins <- expected_bins %>%
+    anti_join(Fos_valid_regions, by = c("start1", "end1")) %>%
+      mutate(chr=bin_df,.before='start1')
+  
+  return(missing_bins)
+}
+
+
+
+coverage_dropout <- do.call(rbind,lapply(my_chromosomes,get_missing_bins))
+
+coverage_dropout %>% write.table(file="coverage_dropout.bed",quote=FALSE,sep="\t",col.names = FALSE,row.names = FALSE)
+
+coverage_dropout_stringent <- read.delim(file="oldAnalysis_withDefaultCooler/coverage_dropout.bed", header=F)  #### MORE STRINGENT VERSION 
+colnames(coverage_dropout_stringent) <- c("chr","start1","end1")
+
+```
+
+Get a list of possible boundaries (insulation scores < threshold) using default OHCA parameters and filter stringently
+
+Filter for insulation score of 0.5 (decided empirically based on observations), remove any boundary within 1kb of a coverage dropout region as well as within 1 kb of fosmid edge -> Results in 44 final boundaries
+
+```{r}
+
+Fos_pool <- Fos_pool %>% getBorders() ###retreieves all borders
+
+topologicalFeatures(Fos_pool,"borders") %>% export("Borders_all.bed")
+
+borders_0.5 <- read.table("Borders_all.bed") %>% 
+                      filter(V5>0.5) %>% 
+                          makeGRangesFromDataFrame(seqnames.field = 'V1',start.field = 'V2', end.field = 'V3',keep.extra.columns = T)
+
+coverage_dropout_granges <- coverage_dropout_stringent %>% makeGRangesFromDataFrame(seqnames.field = 'chr', start.field = 'start1',end.field = 'end1')
+
+borders_clean <- borders_0.5[countOverlaps(borders_0.5,coverage_dropout_granges,maxgap = 1000)==0] %>%  
+                    as.data.frame() %>% 
+                        mutate(chr=seqnames,strand='+',center=round((start+end)/2))  %>%
+                            mutate(center_2 = center + 1, start_edge = center - 1000, end_edge = center + 1000) %>%
+                                filter(start_edge>=1 & end_edge <= as.integer(sub(".*:(\\d+)-(\\d+)", "\\2", chr)) - as.integer(sub(".*:(\\d+)-(\\d+)", "\\1", chr))) %>%
+                                  rowid_to_column("Index")
+
+borders_clean %>% select(seqnames,center,center_2,Index,V5) %>% write.table(file="borders_05_stringentDropout_clean.bed",quote=FALSE,sep="\t",col.names = FALSE,row.names = FALSE)
+
+```
+
+Load extra data : Coordinate transformed SuHW and Phaser motifs along with 2-4hr Zelda ChIP-seq peaks
+
+
+```{r}
+
+my_SuHW_sites <- read.delim("../RefData/CoordTransf_SuHW_sites.bed",header=F)
+my_Phaser_sites <- read.delim("../RefData/CoordTransf_Phaser_sites.bed",header=F)
+my_Zelda_sites <- read.delim("../RefData/CoordTransf_GSE152598_Zelda_MTD_0-2hr_C1_x2value_bl.bed",header=F)
+
+```
+
+Plot standard heatmaps (Extended Data 1)
+
+```{r}
+
+
+i <- my_chromosomes[3]
+
+pdf("Insulation_200bpRes_1600bpWindow_border05_stringent.pdf")
+
+for (i in my_chromosomes){
+  
+  
+  Fos_subset <- subsetByOverlaps(Fos_pool,GRanges(data.frame(chrom=i,start=0,end=diff(as.numeric(tail(strsplit(i, "[:-]")[[1]], 2))))))
+  
+  
+  #ggplot_build(p1)$layout$panel_params[[1]]$x.range
+
+  insulation <- coverage(metadata(Fos_subset)$insulation, weight = 'insulation')[[i]]
+  insulation_df <- tibble(pos = cumsum(runLength(insulation)), insulation = runValue(insulation))
+  
+  ##Note : Insulation at the very first and very last bins are problematic -set them to 0
+  insulation_df[1,2] <- 0
+  insulation_df[nrow(insulation_df),2] <- 0
+  
+  p1 <- plotMatrix(Fos_subset,use.scores="balanced",limits=c(-4,-1),caption=FALSE) + coord_cartesian(xlim=range(insulation_df$pos),ylim=rev(range(insulation_df$pos)))
+
+  
+  
+  p2 <- ggplot(insulation_df, aes(x = pos, y = insulation)) + 
+      geom_area() + 
+      theme_void() + 
+      coord_cartesian(ylim=c(-1.5,1.5),expand = FALSE) + 
+      labs(x = "Genomic position", y = "Diamond insulation score") 
+  
+  
+  border_sites <- borders_clean %>%
+    filter(seqnames==i) %>%
+    mutate(midpoint = center, score=1) %>%
+    select(pos=midpoint,Index=Index,score)
+  
+  SuHW_sites <- my_SuHW_sites %>% 
+    filter(V1 == i) %>%
+    mutate(midpoint = (V2 + V3)/2) %>%  
+    select(pos = midpoint, score = 1) %>%  
+    mutate(score = 1) 
+  
+  Phaser_sites <- my_Phaser_sites %>% 
+    filter(V1 == i) %>%
+    mutate(midpoint = (V2 + V3)/2) %>%  
+    select(pos = midpoint, score = 1) %>%  
+    mutate(score = 1) 
+
+  Zelda_sites <- my_Zelda_sites %>% 
+    filter(V1 == i) %>%
+    mutate(score = 1) 
+  
+  
+  border_plot <- ggplot(border_sites, aes(x = pos, y = score)) +
+    geom_point(shape = "|", size = 3, color = "black") + 
+    geom_text(aes(label = Index), vjust = 2, size = 3) +
+    theme_void() +
+    ylim(0.9, 1.1) +  
+    coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos)) +
+    labs(y = "Borders")
+  
+  SuHW_plot <- ggplot(SuHW_sites, aes(x = pos, y = score)) +
+    geom_point(shape = "|", size = 3, color = "black") + 
+    theme_void() +
+    ylim(0.9, 1.1) +  
+    coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos)) +
+    labs(y = "SuHW sites")
+  
+  Phaser_plot <- ggplot(Phaser_sites, aes(x = pos, y = score)) +
+    geom_point(shape = "|", size = 3, color = "red") +  # Vertical ticks
+    theme_void() +
+    ylim(0.9, 1.1) +  # Small range to make ticks visible
+    coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos)) + 
+    labs(y = "Phaser sites")
+  
+  Zelda_plot <-  ggplot() +
+  geom_rect(data = Zelda_sites, 
+            aes(xmin = V2, xmax = V3, ymin = 0, ymax = 1),
+            fill = "blue", alpha = 0.5) +
+  theme_void() + 
+  coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos))
+  
+  p3 <- patchwork::wrap_plots(p1, p2, border_plot, SuHW_plot, Phaser_plot, Zelda_plot, ncol = 1, heights = c(10,1,1,0.2,0.2,0.2)) 
+  
+  print(p3)
+  
+}
+dev.off()
+
+
+```
+Same plots, but with raw counts (Optional : For relatively shorter interactions upto 100kb, ICEing doesn't make a huge difference)
+
+```{r}
+
+i <- my_chromosomes[3]
+
+pdf("Insulation_200bpRes_1600bpWindow_border05_stringent_rawCounts.pdf")
+
+for (i in my_chromosomes){
+  
+  
+  Fos_subset <- subsetByOverlaps(Fos_pool,GRanges(data.frame(chrom=i,start=0,end=diff(as.numeric(tail(strsplit(i, "[:-]")[[1]], 2))))))
+  
+  
+  #ggplot_build(p1)$layout$panel_params[[1]]$x.range
+
+  insulation <- coverage(metadata(Fos_subset)$insulation, weight = 'insulation')[[i]]
+  insulation_df <- tibble(pos = cumsum(runLength(insulation)), insulation = runValue(insulation))
+  
+  ##Note : Insulation at the very first and very last bins are problematic -set them to 0
+  insulation_df[1,2] <- 0
+  insulation_df[nrow(insulation_df),2] <- 0
+  
+  p1 <- plotMatrix(Fos_subset,use.scores="count",limits=c(0,3),caption=FALSE) + coord_cartesian(xlim=range(insulation_df$pos),ylim=rev(range(insulation_df$pos)))
+
+  
+  
+  p2 <- ggplot(insulation_df, aes(x = pos, y = insulation)) + 
+      geom_area() + 
+      theme_void() + 
+      coord_cartesian(ylim=c(-1.5,1.5),expand = FALSE) + 
+      labs(x = "Genomic position", y = "Diamond insulation score") 
+  
+  
+  border_sites <- borders_clean %>%
+    filter(seqnames==i) %>%
+    mutate(midpoint = center, score=1) %>%
+    select(pos=midpoint,Index=Index,score)
+  
+  SuHW_sites <- my_SuHW_sites %>% 
+    filter(V1 == i) %>%
+    mutate(midpoint = (V2 + V3)/2) %>%  
+    select(pos = midpoint, score = 1) %>%  
+    mutate(score = 1) 
+  
+  Phaser_sites <- my_Phaser_sites %>% 
+    filter(V1 == i) %>%
+    mutate(midpoint = (V2 + V3)/2) %>%  
+    select(pos = midpoint, score = 1) %>%  
+    mutate(score = 1) 
+
+  Zelda_sites <- my_Zelda_sites %>% 
+    filter(V1 == i) %>%
+    mutate(score = 1) 
+  
+  
+  border_plot <- ggplot(border_sites, aes(x = pos, y = score)) +
+    geom_point(shape = "|", size = 3, color = "black") + 
+    geom_text(aes(label = Index), vjust = 2, size = 3) +
+    theme_void() +
+    ylim(0.9, 1.1) +  
+    coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos)) +
+    labs(y = "Borders")
+  
+  SuHW_plot <- ggplot(SuHW_sites, aes(x = pos, y = score)) +
+    geom_point(shape = "|", size = 3, color = "black") + 
+    theme_void() +
+    ylim(0.9, 1.1) +  
+    coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos)) +
+    labs(y = "SuHW sites")
+  
+  Phaser_plot <- ggplot(Phaser_sites, aes(x = pos, y = score)) +
+    geom_point(shape = "|", size = 3, color = "red") +  # Vertical ticks
+    theme_void() +
+    ylim(0.9, 1.1) +  # Small range to make ticks visible
+    coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos)) + 
+    labs(y = "Phaser sites")
+  
+  Zelda_plot <-  ggplot() +
+  geom_rect(data = Zelda_sites, 
+            aes(xmin = V2, xmax = V3, ymin = 0, ymax = 1),
+            fill = "blue", alpha = 0.5) +
+  theme_void() + 
+  coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos))
+  
+  p3 <- patchwork::wrap_plots(p1, p2, border_plot, SuHW_plot, Phaser_plot, Zelda_plot, ncol = 1, heights = c(10,1,1,0.2,0.2,0.2)) 
+  
+  print(p3)
+  
+}
+dev.off()
+
+
+
+```
+
+Horizontal heatmaps for comparison with in vivo MicroC data shared by Noura Maziak (Maziak et al., 2025 Nature Genetics)
+
+```{r}
+
+
+pdf("Insulation_200bpRes_Horizontal.pdf", height=6,width=12)
+
+for (i in my_chromosomes){
+  
+  Fos_subset <- subsetByOverlaps(Fos_pool,GRanges(data.frame(chrom=i,start=0,end=diff(as.numeric(tail(strsplit(i, "[:-]")[[1]], 2))))))
+  
+
+  insulation <- coverage(metadata(Fos_subset)$insulation, weight = 'insulation')[[i]]
+  insulation_df <- tibble(pos = cumsum(runLength(insulation)), insulation = runValue(insulation))
+  
+  ##Note : Insulation at the very first and very last bins are problematic -set them to 0
+  insulation_df[1,2] <- 0
+  insulation_df[nrow(insulation_df),2] <- 0
+  
+  p1 <- plotMatrix(Fos_subset,use.scores="balanced", limits = c(-4,-1), maxDistance=diff(as.numeric(tail(strsplit(i, "[:-]")[[1]], 2))),caption=FALSE) +
+        coord_cartesian(xlim=range(insulation_df$pos))
+
+  print(p1)
+  
+}
+dev.off()
+
+
+```
+
+

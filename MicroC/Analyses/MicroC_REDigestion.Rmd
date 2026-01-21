@@ -1,0 +1,263 @@
+---
+title: "MicroC RE digestion analysis"
+author: "Muhunden Jayakrishnan"
+date: "08/12/2025"
+output: html_document
+---
+
+Differential ananlyses for Restriction Enzyme digestion MicroC experiments (Figure 6)
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+
+
+## Install GENOVA -- Note that installation works only from local RProjects (.ie. not on mounted network drives!)
+library("remotes")
+library("GENOVA")
+library("tibble")
+library("tidyverse")
+
+library("GenomicRanges")
+library("HiCExperiment")
+library("HiCool")
+library("HiContacts")
+library("HiContactsData")
+library("fourDNData")
+library("DNAZooData")
+library("InteractionSet")
+
+#BiocManager::install("multiHiCcompare")
+library("multiHiCcompare")
+
+```
+
+Load sample sheet as well as associated .mcool files, dropout regions etc.
+
+```{r LoadSampleSheet}
+
+"%ni%" <- Negate("%in%")
+
+#Exclude single replicate for PmelI and AscI from last replicate due to poor quality
+sampleSheet_RE <- openxlsx::read.xlsx("../../SampleSheet_Master.xlsx") %>% filter(grepl("RE_digestion",Groups)) %>% filter(CoolFile %ni% c('MC17_5.mcool','MC6_5.mcool')) 
+
+
+cf_filenames <- list.files(path="../../cool_files/") 
+cf_filenames_RE <- cf_filenames[cf_filenames %in% sampleSheet_RE$CoolFile]
+
+
+### Note : The below line reorders the filenames (and following MicroC_list) according to the original order in the dataframe
+cf_filenames_RE <- cf_filenames_RE[match(sampleSheet_RE$CoolFile,cf_filenames_RE)]
+
+cf_list <- lapply(paste0("../../cool_files/",cf_filenames_RE),CoolFile)
+
+MicroC_list_800bp <- map(cf_list,import, resolution=800)
+MicroC_list_400bp <- map(cf_list,import, resolution=400)
+
+
+my_chromosomes <- seqlevels(MicroC_list_400bp[[1]])
+
+borders <- read.delim("../../Control_Analyses/borders_05_stringentDropout_clean.bed",header=F) 
+
+insulation <- readRDS("../../Control_Analyses/Insulation.rds")
+
+```
+
+Vizualize individual replicates (optional). Note that compared to the pooled control sample with 70 million validPairs, perturbation experiments are of lower complexity/reads. So use lower resolution: 800bp for larger constructs(BACs) and 400bp resolution for Fosmids
+
+```{r}
+
+pdf("RE_IndividualReps.pdf")
+
+for (i in my_chromosomes){
+  
+  my_chr <- GRanges(data.frame(chrom=i,start=0,end=diff(as.numeric(tail(strsplit(i, "[:-]")[[1]], 2)))))
+  
+  if(grepl("MG",i)){
+    Fos_subset_list <- lapply(MicroC_list_800bp,subsetByOverlaps,ranges=my_chr)
+  } else {
+    Fos_subset_list <- lapply(MicroC_list_400bp,subsetByOverlaps,ranges=my_chr)
+
+  }
+
+  names(Fos_subset_list) <- sampleSheet_RE$Treatment_Condition
+  
+  plots_reps <- imap(Fos_subset_list, ~ plotMatrix(
+    .x, use.scores = 'balanced', limits = c(-3, -1.5), caption = FALSE
+) + ggtitle(.y))
+  
+  
+  p1 <- cowplot::plot_grid(plotlist=plots_reps, nrow = 6)
+  
+  print(p1)
+
+
+}
+
+dev.off()                 
+                   
+```
+
+Plot interaction maps alongside differential testing bins as well as log2 difference maps (despeckled to reduce noisy difference pixels).
+
+
+```{r}
+
+
+i <- my_chromosomes[14]
+
+pdf("RE_comparison_new_fc0.35_800400.pdf", height=4.5, width=15)
+
+for (i in my_chromosomes[3]){
+  
+  my_chr <- GRanges(data.frame(chrom=i,start=0,end=diff(as.numeric(tail(strsplit(i, "[:-]")[[1]], 2)))))
+            
+  
+  ## Possibly use different resolutions for BACs and Fosmids
+  
+  if(grepl("MG",i)){
+    Fos_subset_list <- lapply(MicroC_list_800bp,subsetByOverlaps,ranges=my_chr)
+    Fos_subset_list_diffTest <- lapply(MicroC_list_800bp,subsetByOverlaps,ranges=my_chr)
+    res_plot <- 800
+    
+  } else {
+    Fos_subset_list <- lapply(MicroC_list_400bp,subsetByOverlaps,ranges=my_chr)
+    Fos_subset_list_diffTest <- lapply(MicroC_list_400bp,subsetByOverlaps,ranges=my_chr)
+    res_plot <- 400
+  }
+  
+  
+    
+  if(grepl("MG_3",i)){
+   loops_HM <- GInteractions(GRanges(data.frame(chrom="MG_3::chr2R:9937874-10035582", start=(35101-500), end=(35101+500))), GRanges(data.frame(chrom="MG_3::chr2R:9937874-10035582", start=(51101-500), end=(51101+500))))
+   
+   loops_diff <- GInteractions(GRanges(data.frame(chrom="1", start=(35101-500), end=(35101+500))), GRanges(data.frame(chrom="1", start=(51101-500), end=(51101+500))))
+    
+  } else {
+    
+    loops_HM <- NULL
+    loops_diff <- NULL
+  }
+
+  
+  ##These insulation tracks are needed to define the edges of the plots 
+  insulation_df <- tibble(pos = cumsum(runLength(insulation[[i]])), insulation = runValue(insulation[[i]]))  
+  
+  ##Subset BAC/Fos list
+  
+  ##Borders for reference
+  border_sites <- borders %>%
+    filter(V1==i) %>%
+    mutate(midpoint = V2, score=1) %>%
+    select(pos=midpoint,Index=V4,score)
+  
+   border_plot <- ggplot(border_sites, aes(x = pos, y = score)) +
+        geom_point(shape = "|", size = 3, color = "black") +
+        geom_text(aes(label = Index), vjust = 2, size = 3) +
+        theme_void() +
+        ylim(0.9, 1.1) +
+        coord_cartesian(expand = FALSE, xlim=range(insulation_df$pos)) +
+        labs(y = "Borders")
+  
+  ######################################################################################################################################
+  ################################################ Differential-testing ################################################################
+  ######################################################################################################################################
+  
+  ## Subset raw counts for differential testing, define testing and filter for significant differences
+  
+  Fos_subset_diffTest <- map(Fos_subset_list_diffTest, ~ .x %>% interactions() %>% as.data.frame() %>% select(start1,start2,count) %>% mutate(chr=1) %>% relocate(chr))
+  
+  ### Batches are defined by experiment number -> automatically convert into integers assuming Control appears first*
+  ###  Groups are defined by the treatment -> automatically convert into integers assuming Control appears first*
+  
+  batch <- data.frame(batch=match(sampleSheet_RE$Experiment_Number, unique(sampleSheet_RE$Experiment_Number)))
+  groups <- match(sampleSheet_RE$Treatment_Condition, unique(sampleSheet_RE$Treatment_Condition))
+  
+  mhicc <- make_hicexp(data_list = Fos_subset_diffTest, groups = groups, covariates = batch, A.min = 2)
+  mhicc_norm <- cyclic_loess(mhicc)
+  
+  d <- model.matrix(~factor(meta(mhicc_norm)$group) + factor(meta(mhicc_norm)$batch))
+  
+  conditions <- unique(sampleSheet_RE$Treatment_Condition)
+
+  
+  j <- 3
+  
+  for (j in seq_along(conditions)[-1]){
+    
+    condition <- conditions[j]
+    
+    expt_ID_cond <- sampleSheet_RE %>% filter(Treatment_Condition == condition) %>% pull(Library_Experiment_ID)
+
+    mhicc_norm_cond <- tryCatch(
+      {
+        hic_glm(mhicc_norm, method="QLFTest", p.method = "fdr", coef=j, design = d)
+      },
+      error = function(e) {
+        message(glue::glue("Skipping {i}, condition {condition} due to hic_glm() error: {e$message}"))
+        return(NULL)
+      }
+    )
+    
+    if (is.null(mhicc_norm_cond)) {
+          next
+        }
+  
+    results_cond <- results(mhicc_norm_cond) %>%  mutate(seqnames1=chr,seqnames2=chr,start1=region1,start2=region2,end1=start1+(res_plot-1),end2=start2+(res_plot-1)) %>%
+                          filter(abs(logFC) >= 0.35, p.value <= 0.1) %>% df2gi()
+    
+     ##First section of the plot -> Side-by-side balanced maps for Treat vs Control along with reference borders
+  
+    p1 <- plotMatrix(do.call(merge, Fos_subset_list[(sampleSheet_RE$Treatment_Condition == condition) & (sampleSheet_RE$Library_Experiment_ID %in% expt_ID_cond)]),
+              compare.to = do.call(merge, Fos_subset_list[sampleSheet_RE$Treatment_Condition == "Control" & (sampleSheet_RE$Library_Experiment_ID %in% expt_ID_cond)]), 
+              limits = limits, caption=FALSE, loops=loops_HM) + coord_cartesian(xlim=range(insulation_df$pos),ylim=rev(range(insulation_df$pos)))
+   
+   
+    p11 <- p1 / border_plot + 
+        patchwork::plot_layout(heights = c(1, 0.1))
+    
+  
+     ## Plot differences along with reference borders 
+    
+    p2 <- plotMatrix(results_cond, use.scores = 'logFC', scale = 'linear', limits = c(-2, 2), loops = loops_diff ,cmap = bgrColors()) + coord_cartesian(xlim=range(insulation_df$pos),ylim=rev(range(insulation_df$pos)))
+    
+    p22 <- p2 / border_plot + 
+        patchwork::plot_layout(heights = c(1, 0.1))
+    
+    ###### Stitch plots together using cowplot
+    
+    
+    div_matrix <- divide(do.call(merge, Fos_subset_list[(sampleSheet_RE$Treatment_Condition == condition) & (sampleSheet_RE$Library_Experiment_ID %in% expt_ID_cond)]), by = do.call(merge, Fos_subset_list[sampleSheet_RE$Treatment_Condition == "Control" & (sampleSheet_RE$Library_Experiment_ID %in% expt_ID_cond)]), pseudocount = 0.01)
+    
+    div_matrix <- despeckle(div_matrix, use.scores = 'balanced.l2fc', focal.size = 1)
+    
+     p3 <- plotMatrix(
+        div_matrix, 
+        use.scores = 'balanced.l2fc.despeckled', 
+        scale = 'linear', 
+        limits = c(-1, 1),
+        caption=FALSE,
+        loops= loops_HM,
+        cmap = bgrColors()
+    )
+    
+      p33 <- p3 / border_plot + 
+        patchwork::plot_layout(heights = c(1, 0.1))
+   
+     
+    p7 <- cowplot::plot_grid(
+          p11,p22,p33, 
+          align = "hv", axis = 'tblr', nrow = 1, labels= c("","",condition))
+    
+    print(p7)
+      
+  }
+  
+  
+  
+}
+dev.off()
+
+
+
+```
+

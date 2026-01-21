@@ -1,0 +1,906 @@
+---
+title: "Control Analyses"
+author: "Muhunden Jayakrishnan"
+date: "12/14/2025"
+output: html_document
+---
+
+Exploratory analyses of nucleosome phasing data for Jayakrishnan et al., 2026
+
+```{r setup, include=FALSE}
+
+
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r init, message=FALSE}
+library(stringr)
+library(GenomicFeatures)
+library(RColorBrewer)
+library(matrixStats)
+library(grid)
+library(gridBase)
+library(gridExtra)
+library(tsTools)
+library(BiocParallel)
+library(GenomicAlignments)
+library(LSD)
+library(csaw)
+library(pheatmap)
+library(Vennerable)
+library(writexl)
+library(LSD)
+library(TxDb.Dmelanogaster.UCSC.dm6.ensGene)
+library(IRanges)
+#library(ShortRead)
+library(ComplexHeatmap)
+library(circlize)
+library(dendextend)
+library(genefilter)
+library(tidyverse)
+library(zoo)
+library(matrixStats)
+library(tsTools)
+library(Vennerable)
+#library(HelpersforChIPSeq)
+library(plotly)
+library(pbapply)
+library(ggsci)
+library(BSgenome.Dmelanogaster.UCSC.dm6)
+library(multtest)
+library(ChIPpeakAnno)
+
+#source("../functions/functions.R")
+
+`%nin%` = Negate(`%in%`)
+
+
+```
+
+We now call Phased Nucleosome Arrays using z-score normalized SDE scores calculated from Baldi et al., approach.
+
+First load relevant data including motifs, dropout blacklist regions, MNase-seq and SDE coverages of pooled Control sample as well as MicroC insulation
+
+```{r data-load}
+
+SuHW_sites <- read.delim("./referenceScripts/CoordTransf_SuHW_sites.bed",header=FALSE) %>% 
+  makeGRangesFromDataFrame(seqnames.field = 'V1',start.field = 'V2',end.field = 'V3')
+
+Phaser_sites <- read.delim("./referenceScripts/CoordTransf_Phaser_sites.bed",header=FALSE) %>% 
+  makeGRangesFromDataFrame(seqnames.field = 'V1',start.field = 'V2',end.field = 'V3')
+
+#Blacklist regions
+
+coverage_dropout <- read.delim("./referenceScripts//coverage_dropout.bed",header=F) %>% makeGRangesFromDataFrame(seqnames.field = 'V1', start.field = 'V2',end.field = 'V3')
+
+
+my_Fos_chromosomes <- read.delim("/Users/ra36doj/Desktop/mount/ChIP_Seq/240205_SandroFosmids/FosmidsGenome/GenomeAssembly_v4/28xFos_genome.bed",header=F) %>% mutate(name=paste0(V4,"::",V1,":",V2,"-",V3))
+
+## Wigs and Bigwigs
+
+insulation_scores <- import.bw("./referenceScripts/MC_pooled_insulation_1600kbWin.bw") %>% coverage(weight="score") %>% keepSeqlevels(my_Fos_chromosomes$name)
+MNase_coverage <- import.bw("./ControlPooled_ranges_copyNorm.bw") %>% coverage(weight = "score")
+SDE_coverage <- import.wig("../SDE/ControlPooled_ranges_dyadCov_spec_179.wig") %>% coverage(weight="score")
+
+
+```
+
+We used z-score transformed version of the SDE coverage and extract PNAs (defined as z >= 2 and minimum length of 550 bp)
+
+```{r}
+
+data_path <- file.path("./Control_Analyses")
+
+if(!dir.exists(data_path))
+  dir.create(data_path)
+
+
+sde_zscore_calculate<- function(covs) {
+	v <- log2(as.vector(unlist(covs)))
+	flt <- v!=0 & !is.infinite(v)
+	m <- mean(v[flt], na.rm=T)
+	std <- sd(v[flt], na.rm=T)
+	covss <- round(2^(((log2(covs)-m) / std)), 2)
+	names(covss) <- names(covs)
+	covss
+}
+
+SDE_zscore <- sde_zscore_calculate(SDE_coverage)
+
+
+WT_PNA <- as(IRanges::slice(SDE_zscore, lower=2, rangesOnly=T), "GRanges") 
+
+WT_PNA <- WT_PNA[width(WT_PNA)>550]
+
+WT_PNA <- WT_PNA[countOverlaps(WT_PNA,coverage_dropout,maxgap = 1000)==0]
+
+WT_PNA %>% as.data.frame() %>% write_delim(file="./Control_Analyses/WT_PNA_z2_550_old.bed",quote="none",col_names=F, delim = "\t")
+
+median(width(WT_PNA))
+length(WT_PNA)
+
+```
+
+Initial call results in about 200 PNAs. Filtering for periodicity of atleast 3 nucleosomes (assuming 180bp per nucleosome with linkers) results in final 120 PNAs
+
+How is the overlap? 
+
+```{r}
+
+## 
+
+SuHW_overlap <- countOverlaps(WT_PNA,SuHW_sites) > 0
+Phaser_overlap <- countOverlaps(WT_PNA,Phaser_sites) > 0
+
+
+nonInsulator_PNA <- WT_PNA[!SuHW_overlap & !Phaser_overlap]
+
+sum(SuHW_overlap)
+sum(Phaser_overlap)
+length(WT_PNA)
+length(nonInsulator_PNA)
+
+```
+
+Of 120 identified PNAs, 23 contains SuHW motif, 26 contain Phaser motif and 66 are not associated with either motif
+
+Note : Phaser and SuHW motifs usually occur as individual occurrences,but sometimes they occur multiple times within close proximity.These can confuse MNase results, so remove them
+
+```{r}
+###Simple function for removing closely occurring motifs
+
+filter_isolated_motifs <- function(
+  gr,
+  distance = 500,
+  ignore.strand = TRUE
+) {
+  gr <- sort(gr)
+
+  hits <- findOverlaps(
+    gr, gr,
+    maxgap = distance,
+    ignore.strand = ignore.strand
+  )
+
+  # remove self-hits
+  hits <- hits[queryHits(hits) != subjectHits(hits)]
+
+  # motifs that have ANY neighbor within distance
+  to_remove <- unique(queryHits(hits))
+
+  # keep only isolated motifs
+  gr[-to_remove]
+}
+
+
+Phaser_reduced_sites <- filter_isolated_motifs(Phaser_sites)
+SuHW_reduced_sites <- filter_isolated_motifs(SuHW_sites)
+
+
+
+```
+
+After filtering, 42/47 SuHW motifs and 41/48 Phaser motifs are retained
+
+Generate centers for Heatmaps and cumulative plots (Figure 1). Remove peaks that are witihin 1 kb of problematic microC coverage dropout regions
+
+```{r my_centers}
+
+
+SuHW_centers <- SuHW_reduced_sites[countOverlaps(SuHW_reduced_sites,coverage_dropout,maxgap = 1000)==0] %>% as.data.frame() %>%
+                    mutate(chr=seqnames,strand='+',center=round((start+end)/2)) 
+rownames(SuHW_centers) <- paste0(SuHW_centers$chr," ",SuHW_centers$center)
+
+Phaser_centers <- Phaser_reduced_sites[countOverlaps(Phaser_reduced_sites,coverage_dropout,maxgap = 1000)==0] %>% as.data.frame() %>%
+                    mutate(chr=seqnames,strand='+',center=round((start+end)/2))
+rownames(Phaser_centers) <- paste0(Phaser_centers$chr," ",Phaser_centers$center)
+
+nonInsPNA_centers <- nonInsulator_PNA[countOverlaps(nonInsulator_PNA,coverage_dropout,maxgap = 1000)==0] %>% as.data.frame() %>%
+                    mutate(chr=seqnames,strand='+',center=round((start+end)/2))
+rownames(nonInsPNA_centers) <- paste0(nonInsPNA_centers$chr," ",nonInsPNA_centers$center)
+
+
+```
+Further filtering to remove problematic regions retains 31/41 Phaser Motifs and 39/42 SuHW motifs
+
+
+Generate 50 random centers that will be used as a Control for some analyses
+
+```{r}
+
+generate_random_center <- function(gr) {
+  # Calculate safe range (1kb buffer at each end)
+  safe_start <- 1000
+  safe_end <- width(gr) - 1000
+  
+  # Generate random center within safe range
+  random_center <- sample(safe_start:safe_end, 1)
+  
+  GRanges(seqnames = seqnames(gr),
+          ranges = IRanges(start = random_center, width = 1),
+          strand = strand(gr))
+}
+
+set.seed(15623) # For reproducibility
+
+valid_regions <- makeGRangesFromDataFrame(my_Fos_chromosomes,
+                                        seqnames.field = "name",
+                                        start.field = "V2",
+                                        end.field = "V3",
+                                        keep.extra.columns = TRUE)
+
+# Weight sampling by region length (larger regions get more chance)
+region_weights <- width(valid_regions)/sum(width(valid_regions))
+selected_regions <- sample(valid_regions, 50, prob = region_weights, replace = TRUE)
+
+
+random_centers <- lapply(seq_along(selected_regions), function(i) {generate_random_center(selected_regions[i])})
+
+random_centers <- do.call(c, random_centers)
+
+
+random_centers <- random_centers[countOverlaps(random_centers,coverage_dropout,maxgap = 1000)==0] %>% as.data.frame()%>%
+                    mutate(chr=seqnames,strand='+',center=start)
+
+rownames(random_centers) <- paste0(random_centers$chr," ",random_centers$center)
+
+
+
+```
+ 
+ 
+Generate matrices containing un-binned coverage (.ie. 1bp coverage) around 3kb from center of sites.
+
+
+```{r}
+
+library(HelpersforChIPSeq)
+
+my_window_size <- 3000
+my_binning <- 1
+
+
+mat_path <- file.path("./matrices_PNAsite_centered_noBinning")
+
+if(!dir.exists(mat_path))
+  dir.create(mat_path)
+
+
+
+## list stuff for plotting
+
+my_covs <- c('insulation_scores','SDE_coverage','MNase_coverage')
+my_centers <- ls(pattern = ".*centers")
+
+
+i <- 1
+j <- 1
+
+parallel::mclapply(seq_along(my_covs), mc.cores = 4, FUN = function(i){
+  
+    my_cov <- get(my_covs[i])  
+    
+    for (j in my_centers){
+        my_name <-  paste("mat_",my_covs[i],"_",j,sep="")
+    
+        my_mat <- coverageWindowsCenteredStranded(centers = get(j),
+                                                  window.size = my_window_size,
+                                                  coverage = my_cov)
+        
+        #remove problematic entries
+        my_mat[is.infinite(my_mat) | is.nan(my_mat)] <- 0
+        
+        my_mat <- binMeansMatrix(my_mat, my_binning)
+        
+        assign(my_name, my_mat)
+        fname <- file.path(mat_path,my_name)
+        saveRDS(object = my_mat,file=paste0(fname,".rds",sep=""))
+      
+    }
+    
+  
+  
+})
+
+################# load site centered matrices###################################################
+
+my_mat_file_names <- list.files(path = "matrices_PNAsite_centered_noBinning/",pattern = "*rds$")
+
+for(i in seq_along(my_mat_file_names)){
+  
+  my_mat_file <- readRDS(file.path("matrices_PNAsite_centered_noBinning/", my_mat_file_names[i]))
+  assign(gsub(".rds","",my_mat_file_names[i]),my_mat_file)
+  
+}
+
+```
+
+Now site centered composite plot for MNase-seq data (Figure 1C)
+
+```{r}
+
+
+################# plot site centered composite and heatmaps- data is log trasnfromed by plot_composite ###################################################
+
+my_mats <- ls(pattern = "^mat_.*_centers$")
+
+my_mats_MNase <- my_mats[grep("MNase",my_mats)]
+
+my_colors <- c("#999999","#0072B2", "#CC79A7", "#009E73", "#E69F00", "#D55E00", "#56B4E9", "#F0E442")
+
+i <- 1
+
+pdf(file = "./matrices_PNAsite_centered_noBinning/composite_plots_MNase.pdf", width = 12, height = 9)
+
+      
+for (i in seq_along(my_centers)){
+        
+      my_center <- my_centers[i]
+      my_mat_centers <- my_mats_MNase[grep(my_center,my_mats_MNase)]
+    
+      par(mfcol=c(4,6),  oma=c(2,2,2,2), mar=c(4,4,2,0))
+          
+      HelpersforChIPSeq::plotComposite(my_mat_centers, 
+                                           my_title = my_center,
+                                           my_sub_range = 500:2500,
+                                           ylims = c(0.5,2),
+                                           my_binning = my_binning,
+                                           my_colors_composite = my_colors,
+                                           site_label = "",
+                                           line_lwd = 1,
+                                           smoother = 21,
+                                           log_scale = FALSE,
+                                           add_range = NULL)
+          
+      mtext(text = "Occupancy", side = 2, line = 2)
+          
+      legend("topleft", legend = paste("n =", nrow(get(my_mat_centers[1]))), cex=1, bty = "n")
+          
+      mtext(text = "Occupancy", side = 2, outer = TRUE)
+      
+      par(mfrow=c(1,1), oma=c(1,0,0,0), mar=c(0,0,0,0), new=TRUE)
+      
+      plot(0,0, type="n", xaxt="n",yaxt="n", bty="n", xlab="", ylab="")
+      
+      legend("bottom", legend = my_mat_centers, 
+             cex=1, bty = "n", fill  = my_colors, horiz = T)
+      
+        
+}
+
+dev.off()
+
+write.xlsx(list("SuHW"=as.data.frame(mat_MNase_coverage_SuHW_centers), "Phaser"=data.frame(mat_MNase_coverage_Phaser_centers), "otherPNA"=data.frame(mat_MNase_coverage_nonInsPNA_centers),"random"=data.frame(mat_MNase_coverage_random_centers)), file="Control_Analyses/sourceData_MNaseseq_coverage.xlsx",row.names=TRUE)
+
+
+```
+
+Optional, heatmap vizualisation at individual sites.
+
+```{r}
+
+for (i in seq_along(my_centers)){
+  
+        my_center <- my_centers[i]
+  
+        pdf(file = paste0("./matrices_PNAsite_centered_noBinning/Heatmaps_MNase_",my_center,".pdf"), height = 7, width = 7)
+        
+        my_mats_MNase_center <- my_mats_MNase[grep(my_center,my_mats_MNase)]
+    
+        my_order <- order(rowMeans(get(my_mats_MNase_center[1])), decreasing = T)
+            
+        orderMats(my_mats = my_mats_MNase_center,
+                      my_order = my_order)
+            
+        #all(sapply(seq_along(my_mats), function(i){(identical(rownames(get(my_mats[length(my_mats)])), rownames(get(my_mats[i]))))}))
+            
+            
+        HelpersforChIPSeq::plotHeatmap(my_sample_mats = my_mats_MNase_center, 
+                                           my_sample_names = my_mats_MNase_center,
+                                           my_site_name = my_center,
+                                           my_binning = my_binning,
+                                           my_colors = colorRampPalette(rev(brewer.pal(n = 9, name ="RdYlBu")))(100),
+                                           min_value = 0,
+                                           max_value = 2
+        )
+        
+        dev.off()
+  
+}
+
+
+```
+
+
+Lets perform averaged boxplots for different categories (Extended Data 3) - Restrict analysis to 500 bp window around the center
+
+```{r}
+
+
+combined_df <- map_dfr(my_mats, ~ {
+  mat <- get(.x)  
+  # Extract metadata from matrix name
+  parts <- unlist(strsplit(.x, "_"))
+  coverage_type <- paste(parts[2:3], collapse = "_")
+  center_type <- parts[length(parts)-1]
+  
+  data.frame(
+    original_id = rownames(mat),
+    row_mean = rowMeans(mat[,1250:1750], na.rm = TRUE),
+    coverage_type = coverage_type,
+    center_type = center_type,
+    stringsAsFactors = FALSE
+  )
+})
+
+# Optional: Convert center_type to factor with specific order
+combined_df <- combined_df %>%
+  mutate(center_type = factor(center_type, 
+                            levels = c("random", "Phaser", "SuHW", "nonInsPNA")))
+
+
+```
+
+Plot !
+
+```{r}
+
+write_xlsx(combined_df, path = 'Control_Analyses/sourceData_SDE_MNase_Insulation.xlsx')
+
+
+pdf("./Control_Analyses/SDE.pdf",height = 5,width = 5)
+
+combined_df %>% filter(coverage_type == 'SDE_coverage') %>% ggplot(aes(x=center_type,y=row_mean)) + geom_boxplot() + geom_point() + theme_bw() + stat_summary(fun.data=function(x){return(c(y = 200, label = length(x)))}, geom="text") + labs(x='Region Type',y='SDE score')
+
+dev.off()
+
+pdf("./Control_Analyses/Insulation.pdf",height = 5,width = 5)
+
+combined_df %>% filter(coverage_type == 'insulation_scores') %>% ggplot(aes(x=center_type,y=row_mean)) + geom_boxplot() + geom_point() + theme_bw() + stat_summary(fun.data=function(x){return(c(y = 0.5, label = length(x)))}, geom="text") + labs(x='Region Type',y='Insulation score') + geom_hline(yintercept=0,linetype='dashed', color='red')
+
+dev.off()
+
+
+pdf("./Control_Analyses/InsulationvsSDE_scatter.pdf",height = 5,width = 5)
+
+combined_df %>% filter(center_type == "SuHW") %>% select(original_id, coverage_type, row_mean) %>% pivot_wider(names_from = coverage_type, values_from = row_mean) %>%
+  ggplot(aes(x = insulation_scores, y = SDE_coverage)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Insulation Scores vs SDE Coverage (SuHW Centers)",
+       x = "Insulation Scores (mean)",
+       y = "SDE Coverage (mean)") +
+  theme_minimal()
+
+dev.off()
+
+```
+
+Optional : 
+Instead of using motifs are reference, directly calculate insulation and SDE at PNA classes --- THIS IS PROBLEMATIC AS PNAs ARE QUITE WIDE SO AVERAGING WITHIN PNAs REDUCES THE EFFECTS DRAMATICALLY 
+
+```{r}
+
+# SuHW_PNA <- WT_PNA[SuHW_overlap]
+# Phaser_PNA <- WT_PNA[Phaser_overlap]
+# 
+# mean_cov_by_grange <- function(cov){
+#   grs <- list(nonInsulator_PNA=nonInsulator_PNA, SuHW_PNA=SuHW_PNA, Phaser_PNA=Phaser_PNA, random= random_centers_grange)
+#   do.call(rbind, lapply(names(grs), function(n){
+#     g <- grs[[n]]
+#     data.frame(
+#       coord=paste0(seqnames(g),":",start(g),"-",end(g)),
+#       mean_score=unlist(lapply(seq_along(g), function(i)
+#         mean(Views(cov[[as.character(seqnames(g)[i])]], start(g)[i], end(g)[i]))
+#       )),
+#       grange_name=n
+#     )
+#   }))
+# }
+# 
+# 
+# 
+# mean_cov_by_grange(SDE_coverage) %>% ggplot(aes(x=grange_name,y=mean_score)) + geom_boxplot() + geom_point() + theme_bw() + stat_summary(fun.data=function(x){return(c(y = 150, label = length(x)))}, geom="text") + labs(x='Region Type',y='SDE score')
+# 
+# 
+# mean_cov_by_grange(insulation_scores) %>% ggplot(aes(x=grange_name,y=mean_score)) + geom_boxplot() + geom_point() + theme_bw() + stat_summary(fun.data=function(x){return(c(y = 1, label = length(x)))}, geom="text") + labs(x='Region Type',y='Insulation score')
+
+
+```
+
+
+Which proteins bind at different boundaries? (Figure 2)
+
+Read in previously calculated 44 boundaries 
+
+
+```{r}
+
+Fos_boundaries <- read.table("referenceScripts/borders_05_stringentDropout_clean.bed") %>% mutate(start = V2 - 500, end = V3 + 499) %>%
+              filter(start>=1 & end <= as.integer(sub(".*:(\\d+)-(\\d+)", "\\2", V1)) - as.integer(sub(".*:(\\d+)-(\\d+)", "\\1",V1))) 
+
+
+```
+
+Read in logNorm standardized, coordinate transformed bedgraph files for published ChIP-seq datasets. Use these files to calculate average enrichment at 1kb window around boundaries.
+
+```{r}
+
+my_bedgraphs_ins <- list.files(path="/Users/ra36doj/Desktop/mount/ChIP_Seq/240205_SandroFosmids/motif_finder/CoordinateTransform/",pattern="CoordTransfwithLogNorm",full.names = T)
+
+
+
+calculate_profile_averages <- function(center_df) {
+  
+  center_gr <- center_df%>% 
+                      makeGRangesFromDataFrame(seqnames.field = "V1",start.field = 'start', end.field = 'end',keep.extra.columns = FALSE)
+
+  # Initialize matrix to store results
+  result_matrix <- matrix(nrow = length(center_gr), ncol = length(my_bedgraphs_ins))
+  colnames(result_matrix) <- gsub(".*LogNorm_","",gsub("\\_resize.bedgraph$", "", basename(my_bedgraphs_ins)))
+  
+  # Process each ChIP profile
+  for (i in seq_along(my_bedgraphs_ins)) {
+    # Import bedgraph as RLE
+    chip_rle <- import(my_bedgraphs_ins[i], format = "bedGraph") %>% coverage(weight='score')
+    
+    # Calculate average coverage in windows
+    avg_signal <- numeric(length(center_gr))
+    for (j in seq_along(center_gr)) {
+      window <- chip_rle[[as.character(seqnames(center_gr[j]))]]
+      if (!is.null(window)) {
+        region <- window[seq(start(center_gr[j]), end(center_gr[j]))]
+        avg_signal[j] <- mean(region, na.rm = TRUE)
+      } else {
+        avg_signal[j] <- NA
+      }
+    }
+    
+    result_matrix[, i] <- avg_signal
+  }
+  
+  # Combine with original dataframe
+  cbind(center_df, as.data.frame(result_matrix))
+}
+
+
+boundaries_ChIPenrichment <- calculate_profile_averages(Fos_boundaries)
+
+write_xlsx(boundaries_ChIPenrichment, path = 'Control_Analyses/sourceData_boundaries_ChIPenrichment.xlsx')
+
+```
+
+
+Plot as heatmap for only the most stringent boundaries (Figure 2)
+
+```{r}
+
+
+
+plot_df <- boundaries_ChIPenrichment[,c(4,5,8:ncol(boundaries_ChIPenrichment))] %>% select(-c("GSM1536000_IgG_input_NT_Rep2_dm6"))
+
+colnames(plot_df) <- c("index","insulation_score",sub("^[^_]*_([^_]+_[^_]+)_.*$", "\\1", colnames(plot_df)[3:ncol(plot_df)])) 
+
+
+# ChIP_ins_plot <- ComplexHeatmap::Heatmap(plot_df %>% select(-c("insulation_score","index","WT_NC11","WT_NC12","WT_NC13","Ctl_noAdd_SuHWCarla.dmelNorm.dir.bedgraph")),row_labels = plot_df$index,col = colorRamp2(c(0, 3, 6), c("blue", "white", "red")), row_names_gp = gpar(fontsize = 6))
+
+ChIPminimal_ins_plot <- ComplexHeatmap::Heatmap(plot_df[,c(4,5,7,8,9,10,14,15,17,18,19,20,22,26)],row_labels = plot_df$index,col = colorRamp2(c(0, 3, 6), c("blue", "white", "red")), row_names_gp = gpar(fontsize = 6))
+              
+row_order_ChIPins <- row_order(ChIPminimal_ins_plot)       
+
+drex_suhw_plot <- ComplexHeatmap::Heatmap(plot_df %>% select(Ctl_noAdd_SuHWCarla.dmelNorm.dir.bedgraph),row_labels = plot_df$index,col = colorRamp2(c(0, 3, 6), c("blue", "white", "red")),row_order = row_order_ChIPins, row_title_gp = gpar(fontsize = 6), cluster_columns = FALSE)
+
+score_ins_plot <- ComplexHeatmap::Heatmap(plot_df %>% select(insulation_score),row_labels = plot_df$index,col = colorRamp2(c(0.6, 0.9, 1.1), c("yellow", "orange", "red")),row_order = row_order_ChIPins, row_title_gp = gpar(fontsize = 6))
+
+atac_ins_plot <- ComplexHeatmap::Heatmap(plot_df %>% select(WT_NC11,WT_NC12,WT_NC13),row_labels = plot_df$index,col = colorRamp2(c(0, 2, 4), c("blue", "white", "red")),row_order = row_order_ChIPins, row_title_gp = gpar(fontsize = 6), cluster_columns = FALSE)
+
+p1 <- ChIPminimal_ins_plot + drex_suhw_plot + atac_ins_plot +score_ins_plot
+
+pdf("./Control_Analyses/Heatmap_insulation_ChIPenrichment_minimal_withATAC_0.5cutoff.pdf",height=8,width=10)
+
+draw(p1)
+
+dev.off()
+
+
+```
+We now want to plot changes in MNAse-seq SDE scores across different treatments at SuHW, PHaser, nonInsulator PNAs and Control sites. Below function takes in lists of replicates per condition, calculates average SDE score for each landmark and generates box+violin plot (Extended Data 5, 7).  
+
+```{r}
+
+random_centers_grange <- random_centers %>% makeGRangesFromDataFrame(seqnames.field = "chr")
+
+gr_list <- list(
+  SuHW = SuHW_reduced_sites,
+  Phaser = Phaser_reduced_sites,
+  nonInsPNA = nonInsulator_PNA,
+  random = random_centers_grange
+)
+
+window <- 1000
+```
+
+```{r}
+plotCoveragePerGrangesConditions <- function(
+  gr_list,
+  wig_list1,
+  wig_list2,
+  wig_list3,
+  window = 1000,
+  excel_file = "Coverage_values.xlsx"
+) {
+  half <- window %/% 2
+
+  region_mean_cov <- function(gr, wig_files) {
+    n_regions <- length(gr)
+    mat <- matrix(NA_real_, nrow = n_regions, ncol = length(wig_files))
+    for (j in seq_along(wig_files)) {
+      cov <- import.wig(
+        paste0("../SDE/", wig_files[j], "_ranges_dyadCov_spec_Zscore179.wig")
+      ) %>% coverage(weight = "score")
+
+      for (i in seq_len(n_regions)) {
+        chr <- as.character(seqnames(gr[i]))
+        if (!chr %in% names(cov)) next
+        cov_chr <- cov[[chr]]
+        cov_len <- length(cov_chr)
+        center <- start(gr[i])
+        left <- max(1, center - half)
+        right <- min(cov_len, center + half)
+        if (left >= right) next
+        mat[i, j] <- mean(as.numeric(cov_chr[left:right]), na.rm = TRUE)
+      }
+    }
+    list(
+      mean = rowMeans(mat, na.rm = TRUE),
+      sd   = apply(mat, 1, sd, na.rm = TRUE)
+    )
+  }
+
+  library(openxlsx)
+  wb <- createWorkbook()
+
+  plots <- list()
+
+  for (g_idx in seq_along(gr_list)) {
+    gr <- gr_list[[g_idx]]
+
+    c1 <- region_mean_cov(gr, wig_list1)
+    c2 <- region_mean_cov(gr, wig_list2)
+    c3 <- region_mean_cov(gr, wig_list3)
+
+    n_regions <- length(c1$mean)
+
+    df_long <- tibble(
+      region    = rep(seq_len(n_regions), times = 3),
+      condition = factor(
+        rep(c("cond1", "cond2", "cond3"), each = n_regions),
+        levels = c("cond1", "cond2", "cond3")
+      ),
+      mean = c(c1$mean, c2$mean, c3$mean),
+      sd   = c(c1$sd,   c2$sd,   c3$sd)
+    )
+
+    ## -----------------------------
+    ## WRITE TO EXCEL (ONE SHEET)
+    ## -----------------------------
+    sheet_name <- names(gr_list)[g_idx]
+    addWorksheet(wb, sheet_name)
+    writeData(wb, sheet_name, df_long)
+
+    ## -----------------------------
+    ## STATISTICS
+    ## -----------------------------
+    p_vals <- c(
+      wilcox.test(c2$mean, c1$mean, paired = TRUE)$p.value,
+      wilcox.test(c3$mean, c1$mean, paired = TRUE)$p.value
+    )
+
+    p_adj <- p.adjust(p_vals, method = "BH")
+
+    stat_labels <- c(
+      ifelse(p_adj[1] < 0.001, "***",
+      ifelse(p_adj[1] < 0.01,  "**",
+      ifelse(p_adj[1] < 0.05,  "*", "ns"))),
+      ifelse(p_adj[2] < 0.001, "***",
+      ifelse(p_adj[2] < 0.01,  "**",
+      ifelse(p_adj[2] < 0.05,  "*", "ns")))
+    )
+
+    ref_median <- median(
+      df_long$mean[df_long$condition == "cond1"],
+      na.rm = TRUE
+    )
+
+    p <- ggplot(df_long, aes(x = condition, y = mean)) +
+      geom_violin(trim = FALSE) +
+      geom_boxplot(outlier.shape = NA, width = 0.15) +
+      geom_hline(
+        yintercept = ref_median,
+        color = "red",
+        linetype = "dotted",
+        linewidth = 0.8
+      ) +
+      geom_segment(x = 1, xend = 2, y = 4,   yend = 4) +
+      geom_segment(x = 1, xend = 3, y = 4.2, yend = 4.2) +
+      geom_text(x = 1.5, y = 4.05, label = stat_labels[1], size = 5) +
+      geom_text(x = 2,   y = 4.25, label = stat_labels[2], size = 5) +
+      theme_classic() +
+      coord_cartesian(ylim = c(-1, 4.5)) +
+      ylab("Mean SDE score") +
+      xlab("Condition") +
+      ggtitle(paste0(names(gr_list)[g_idx], " (n=", length(gr), ")"))
+
+    plots[[g_idx]] <- p
+  }
+
+  ## save Excel file
+  saveWorkbook(wb, excel_file, overwrite = TRUE)
+
+  return(plots)
+}
+
+
+```
+
+Now run the function to ATP depletion (Extended Data 5) and Protein Factor Depletion (Extended Data 7) experiments 
+
+```{r}
+
+wig_Ctl <- c("MC12_1D","MC19_1D","MC201_1D")
+wig_Apyrase<- c("MC12_4D","MC19_2D","MC201_2D")
+wig_ATPrestore <- c("MC12_5D","MC19_3D")
+
+
+wig_IgG <- c("MC13_2D","MC15_2D")
+wig_SuHW<- c("MC13_3D","MC15_3D","MC15_5D")
+wig_Rad21 <- c("MC13_4D","MC15_4D")
+
+
+ATPmanipulation_plots <- plotCoveragePerGrangesConditions(gr_list = gr_list, wig_list1 = wig_Ctl, wig_list2 = wig_Apyrase, wig_list3 = wig_ATPrestore, excel_file = "./Control_Analyses/sourceData_ATPmanipulation_SDEchange.xlsx")
+
+pdf("./Control_Analyses/ATPmanipulation_SDEChange.pdf",height=5,width=7)
+
+for (p in ATPmanipulation_plots){
+  print(p)
+}
+
+dev.off()
+
+ProteinDepletion_plots <- plotCoveragePerGrangesConditions(gr_list = gr_list, wig_list1 = wig_IgG, wig_list2 = wig_SuHW, wig_list3 = wig_Rad21, excel_file = "./Control_Analyses/sourceData_ProteinDepletion_SDEchange.xlsx")
+
+pdf("./Control_Analyses/ProteinDepletion_SDEChange.pdf",height=5,width=7)
+
+for (p in ProteinDepletion_plots){
+  print(p)
+}
+
+dev.off()
+
+```
+
+
+Comparison between in vivo and in vitro boundaries (Figure 3). Read in coordinate transformed and subsetted NC14 PicoC boundaries from Maziak et al., Nature Genetics
+
+```{r}
+Fos_boundaries_grange <- makeGRangesFromDataFrame((Fos_boundaries %>% select(-c("start","end"))),seqnames.field = 'V1',start.field = 'V2',end.field = 'V3',keep.extra.columns = T)
+
+NC14_boundaries <- read.delim("referenceScripts/CoordTransf_NC14_0.45_16kb_500bp_boundaries_cluster.nocento.bed", header=F) %>% filter(V4!='.') %>%
+                      makeGRangesFromDataFrame(seqnames.field = 'V1',start.field = 'V2',end.field = 'V3',keep.extra.columns = T) 
+NC14_boundaries <- NC14_boundaries[countOverlaps(NC14_boundaries,coverage_dropout,maxgap = 1000)==0]
+
+
+```
+
+82 in vivo boundaries, 73 when filtered to be comparable to in vitro MicroC data
+
+Plot Venn Diagrams (Figure 3b)
+
+```{r}
+
+ov <- findOverlaps(NC14_boundaries, Fos_boundaries_grange,maxgap = 350)
+
+n_NC14 <- length(NC14_boundaries)
+n_Fos  <- length(Fos_boundaries_grange)
+
+n_overlap <- length(unique(queryHits(ov)))
+n_NC14_only <- n_NC14 - n_overlap
+n_Fos_only  <- n_Fos  - length(unique(subjectHits(ov)))
+
+
+
+venn.plot <- VennDiagram::draw.pairwise.venn(
+  area1 = n_NC14,
+  area2 = n_Fos,
+  cross.area = n_overlap,
+  category = c("NC14 boundaries", "Fos boundaries"),
+  fill = c("#1f78b4", "#e31a1c"),
+  alpha = 0.5,
+  cex = 1.5,
+  cat.cex = 1.5,
+  scaled = TRUE
+)
+
+pdf("Control_Analyses/Venn_NC14vsInVitroBoundaries_350bpOverlap.pdf",height=2.5,width=2.5)
+grid.newpage()
+grid.draw(venn.plot)
+dev.off()
+
+rm(venn.plot,n_overlap,n_NC14_only,n_Fos_only,n_NC14,n_Fos)
+
+```
+
+Assess proportions of different classes for the different types of boundaries (Figure 3c)
+
+```{r}
+
+pdf("Control_Analyses/PieChat_NC14_unique_shared_boundaryProps.pdf")
+NC14_boundaries%>% as.data.frame() %>% pull(V4) %>% table() %>% pie(main="NC14 Boundary Class Proportion - All NC14 boundaries")
+NC14_boundaries[queryHits(ov)] %>% as.data.frame() %>% pull(V4) %>% table() %>% pie(main="NC14 Boundary Class Proportion at Shared Boundaries")
+NC14_boundaries[setdiff(seq_along(NC14_boundaries), queryHits(ov))] %>% as.data.frame() %>% pull(V4) %>% table() %>% pie(main="NC14 Boundary Class Proportion at NC14-unique Boundaries")
+dev.off()
+
+write.xlsx(list("OverlapIndices"=data.frame(ov), "query_NC14_boundaries"=data.frame(NC14_boundaries), "subject_DREX_boundaries"=data.frame(Fos_boundaries_grange)), file="Control_Analyses/sourceData_OverlapAnalysis.xlsx",row.names=TRUE)
+
+Fos_boundaries_grange[setdiff(seq_along(Fos_boundaries_grange), subjectHits(ov))]
+
+```
+```{r}
+
+plot_data <- bind_rows(
+  data.frame(
+    Class = (NC14_boundaries %>% as.data.frame() %>% pull(V4)),
+    Type = "All NC14 Boundaries",
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    Class = (NC14_boundaries[queryHits(ov)] %>% as.data.frame() %>% pull(V4)),
+    Type = "Shared Boundaries",
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    Class = (NC14_boundaries[setdiff(seq_along(NC14_boundaries), queryHits(ov))] %>% 
+  as.data.frame() %>% pull(V4)),
+    Type = "NC14-Unique Boundaries",
+    stringsAsFactors = FALSE
+  )
+) %>%
+  group_by(Type, Class) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  group_by(Type) %>%
+  mutate(
+    Proportion = Count / sum(Count),
+    Label = paste0(Count, "\n(", round(Proportion * 100, 1), "%)")
+  ) %>%
+  ungroup()
+
+write.xlsx(plot_data,file = "Control_Analyses/sourceData_OverlapAnalysis_stackedBar.xlsx",row.names=FALSE)
+
+pdf("Control_Analyses/StackedBar_NC14_boundaryProps_ggplot.pdf", width = 12, height = 8)
+
+ggplot(plot_data, aes(x = Type, y = Proportion, fill = Class)) +
+  geom_bar(stat = "identity", position = "stack", color = "white", width = 0.7) +
+  geom_text(aes(label = Label), 
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "black") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Boundary Class Distribution",
+    x = "Boundary Type",
+    y = "Proportion",
+    fill = "Boundary Class"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.title = element_text(face = "bold", size = 12),
+    legend.position = "right"
+  ) +
+  scale_fill_brewer(palette = "Set3")
+
+dev.off()
+```
+
+
