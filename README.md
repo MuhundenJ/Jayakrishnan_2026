@@ -16,13 +16,13 @@ Description of folder contents :
 
 3) MicroC : Folder containing preprocessing and post-processing analyses scripts for MicroC data.
 
-  a) preprocess : run-nf-hic.sh : Run script for Nextflow based nf-core/hic pipeline. See nf-core website for setup and execution. After standard execution, the cooler_rebalance_rezoomify.sh script is an independent, cooltools based script for changing balancing parameters as used in final figures in the manuscript. 
+   a) preprocess : run-nf-hic.sh : Run script for Nextflow based nf-core/hic pipeline. See nf-core website for setup and execution. After standard execution, the cooler_rebalance_rezoomify.sh script is an independent, cooltools based script for changing balancing parameters as used in final figures in the manuscript. 
 
-  b) Analyses: OHCA (Serizay et al., 2024) based analyses of MicroC data (R 4.3). The MicroC_control.rmd script generates contact maps as displayed in main figures 1-3/extended figures 1-4. The MicroC_REdigestion.rmd file is an example markdown script for differential analyses of MicroC data used in Main figures 4-6/extended data 5-7. 
+   b) Analyses: OHCA (Serizay et al., 2024) based analyses of MicroC data (R 4.3). The MicroC_control.rmd script generates contact maps as displayed in main figures 1-3/extended figures 1-4. The MicroC_REdigestion.rmd file is an example markdown script for differential analyses of MicroC data used in Main figures 4-6/extended data 5-7. 
 
 
 4) Misc : Miscellaneous scripts used in the study
 
-  a) GenomeAssembly : Assembly.sh script generates the reference assembly used in this study based on coordinates in the 28xFos_genome.bed file and dm6 genome fasta file 
-  b) CoordinateTransform : resizeBedgraphWindow.sh script takes in published ChIP-seq datasets to transform the coordinates to the 28xFos_genome as well as perform a logQuantile normalization to make datasets uniform.
+   a) GenomeAssembly : Assembly.sh script generates the reference assembly used in this study based on coordinates in the 28xFos_genome.bed file and dm6 genome fasta file 
+   b) CoordinateTransform : resizeBedgraphWindow.sh script takes in published ChIP-seq datasets to transform the coordinates to the 28xFos_genome as well as perform a logQuantile normalization to make datasets uniform.
   
