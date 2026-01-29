@@ -11,19 +11,7 @@ shortLabel SuHW_ChIP ab2
 longLabel SuHW ChIP-seq signal Rabbit Margulies lab antibody
 
 track bed1
-type bed
-bigDataUrl WT_PNA_z2_550.bed4_renamed.bed
-shortLabel Phased Nucleosome Arrays
-longLabel Phased Nucleosome Arrays derived from MNase-seq data
-
-track bed2
-type bed
-bigDataUrl CoordTransf_Phaser_sites_renamed.bed
-shortLabel Phaser Motifs
-longLabel Phaser Motifs
-
-track bed3
-type bed
-bigDataUrl CoordTransf_SuHW_sites_renamed.bed
+type bigBed 3
+bigDataUrl CoordTransf_SuHW_sites_renamed.bb
 shortLabel SuHW Motifs
 longLabel SuHW Motifs
