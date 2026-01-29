@@ -25,4 +25,5 @@ Description of folder contents :
 
    a) GenomeAssembly : Assembly.sh script generates the reference assembly used in this study based on coordinates in the 28xFos_genome.bed file and dm6 genome fasta file 
    b) CoordinateTransform : resizeBedgraphWindow.sh script takes in published ChIP-seq datasets to transform the coordinates to the 28xFos_genome as well as perform a logQuantile normalization to make datasets uniform.
-  
+
+5) configs_UCSC : Misc files for UCSC genome browser session
