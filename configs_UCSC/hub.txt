@@ -1,0 +1,5 @@
+hub Jayakrishnan_chipseq
+shortLabel SuHW ChIP-seq
+longLabel SuHW ChIP-seq and MNase-seq data aligned to a custom genome
+genomesFile genomes.txt
+email M.Jayakrishnan@bmc.med.lmu.de
