@@ -3,12 +3,16 @@ type bigWig
 bigDataUrl Ctl_noAdd_SuHWBecker.dmelNorm.dir_renamed.bw
 shortLabel SuHW_ChIP ab1
 longLabel SuHW ChIP-seq signal GuineaPig Lei lab antibody
+viewLimits 1:10
+autoScale off
 
 track bw2
 type bigWig
 bigDataUrl Ctl_noAdd_SuHWCarla.dmelNorm.dir_renamed.bw
 shortLabel SuHW_ChIP ab2
 longLabel SuHW ChIP-seq signal Rabbit Margulies lab antibody
+viewLimits 1:10
+autoScale off
 
 track bed1
 type bigBed 3
