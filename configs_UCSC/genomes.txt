@@ -1,0 +1,8 @@
+genome Fosmid_genome
+description January 2026 FosmidsGenome
+organism Drosophila melanogaster (custom)
+defaultPos MG_3:0-90000
+scientificName Drosophila melanogasterFosGen
+twoBitPath 28xFos_genome_renamed.2bit
+chromSizes 28xFos_genome_chrom_renamed.sizes
+trackDb trackDb.txt
